@@ -1,0 +1,120 @@
+name: Publish game
+on:
+  workflow_dispatch:
+    inputs:
+      archive_sha256:
+        description: SHA-256 of the release ZIP
+        type: string
+        required: true
+
+permissions: {}
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download release
+        env:
+          RELEASE_URL: ${{ secrets.GAME_RELEASE_URL }}
+          ARCHIVE_SHA256: ${{ inputs.archive_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ARCHIVE_SHA256" =~ ^[[:xdigit:]]{64}$ ]]
+          [[ "$RELEASE_URL" == https://* ]]
+          cd "$RUNNER_TEMP"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --retry 2 --output game.zip -- "$RELEASE_URL"
+          printf '%s  game.zip\n' "$ARCHIVE_SHA256" | sha256sum --check --strict -
+      - name: Verify and unpack listed files
+        shell: python
+        run: |
+          import hashlib
+          import os
+          import re
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          def checked_path(name):
+              parts = name.split("/")
+              if not name or any(p in ("", ".", "..") or p.startswith(".") for p in parts):
+                  raise ValueError("Unsafe or hidden path")
+              if any(ord(c) < 32 or ord(c) == 127 or c in "\\:" for c in name):
+                  raise ValueError("Invalid path character")
+              return name
+
+          expected = {}
+          for line in Path("runtime.sha256").read_text(encoding="utf-8-sig").splitlines():
+              match = re.fullmatch(r"([a-fA-F0-9]{64}) [ *](.+)", line)
+              if not match:
+                  raise ValueError("Invalid runtime.sha256 line")
+              name = checked_path(match[2])
+              if name in expected:
+                  raise ValueError(f"Duplicate manifest entry: {name}")
+              expected[name] = match[1].lower()
+          if "index.html" not in expected:
+              raise ValueError("Missing index.html in manifest")
+
+          directories = {str(p) for name in expected for p in Path(name).parents if p != Path(".")}
+          if directories & expected.keys():
+              raise ValueError("A manifest entry is both a file and a directory")
+          root = Path(os.environ["RUNNER_TEMP"])
+          output = root / "game-site"
+          output.mkdir()
+          seen = set()
+          with zipfile.ZipFile(root / "game.zip") as archive:
+              for item in archive.infolist():
+                  directory = item.is_dir()
+                  name = checked_path(item.orig_filename.removesuffix("/") if directory else item.orig_filename)
+                  if name in seen:
+                      raise ValueError(f"Duplicate ZIP entry: {name}")
+                  seen.add(name)
+                  kind = stat.S_IFMT(item.external_attr >> 16)
+                  if kind not in (0, stat.S_IFDIR if directory else stat.S_IFREG):
+                      raise ValueError(f"Non-regular ZIP entry: {name}")
+                  if directory:
+                      if name not in directories or item.file_size:
+                          raise ValueError(f"Unexpected directory: {name}")
+                      continue
+                  if name not in expected:
+                      raise ValueError(f"Unlisted file: {name}")
+                  dest = output / name
+                  dest.parent.mkdir(parents=True, exist_ok=True)
+                  digest = hashlib.sha256()
+                  with archive.open(item) as source, dest.open("xb") as target:
+                      while chunk := source.read(256 * 1024):
+                          digest.update(chunk)
+                          target.write(chunk)
+                  if digest.hexdigest() != expected[name]:
+                      raise ValueError(f"Checksum mismatch: {name}")
+          missing = expected.keys() - seen
+          if missing:
+              raise ValueError(f"Missing files: {sorted(missing)}")
+          print(f"Verified {len(expected)} release files")
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ runner.temp }}/game-site
+
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.publish.outputs.page_url }}
+    steps:
+      - name: Publish verified game
+        id: publish
+        uses: actions/deploy-pages@v4
